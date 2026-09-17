@@ -86,10 +86,27 @@ async def budget_management(state: TravelPlanningState) -> TravelPlanningState:
         from travel_planner.data.models import BudgetSummary
 
         total_budget = float(getattr(context, "total_budget", 0.0) or 0.0)
+        # Calculate known planned expenses from the budget context.
         spent = float(
-            sum(float(getattr(expense, "amount", 0.0) or 0.0)
-                for expense in getattr(context, "expenses", []))
+            sum(
+                float(getattr(expense, "amount", 0.0) or 0.0)
+                for expense in getattr(context, "expenses", [])
+            )
         )
+
+        # The local fallback may not contain structured expenses.
+        # In that case, include the costs of activities already scheduled
+        # in the generated itinerary.
+        if spent == 0.0 and state.plan.activities:
+            activity_spend = 0.0
+
+            for itinerary in state.plan.activities.values():
+                for activity in getattr(itinerary, "activities", []):
+                    cost = getattr(activity, "cost", None)
+                    if cost is not None:
+                        activity_spend += float(cost or 0.0)
+
+            spent = activity_spend
         breakdown = {}
         category_map = {
             "flights": "flights",
