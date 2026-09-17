@@ -1,7 +1,29 @@
 import asyncio
+import os
 from datetime import date
 
 import streamlit as st
+
+# Load Streamlit Cloud secrets when running on Streamlit Cloud.
+# Local development continues to use the existing .env configuration.
+try:
+    gemini_api_key = st.secrets.get("GEMINI_API_KEY")
+    supabase_url = st.secrets.get("SUPABASE_URL")
+    supabase_key = st.secrets.get("SUPABASE_KEY")
+except Exception:
+    gemini_api_key = None
+    supabase_url = None
+    supabase_key = None
+
+if gemini_api_key:
+    os.environ["GEMINI_API_KEY"] = gemini_api_key
+    os.environ["OPENAI_API_KEY"] = gemini_api_key
+
+if supabase_url:
+    os.environ["SUPABASE_URL"] = supabase_url
+
+if supabase_key:
+    os.environ["SUPABASE_KEY"] = supabase_key
 
 from travel_planner.data.models import TravelQuery
 from travel_planner.orchestration.states.planning_state import TravelPlanningState
