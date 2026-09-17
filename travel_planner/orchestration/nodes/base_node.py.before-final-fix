@@ -1,0 +1,246 @@
+"""Base node utilities for the travel planning workflow."""
+
+import json
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
+from typing import Any, Callable, Dict, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from travel_planner.orchestration.states.planning_state import TravelPlanningState
+from travel_planner.orchestration.states.workflow_stages import WorkflowStage
+from travel_planner.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class AgentTaskParams(BaseModel):
+    """Parameters used when executing an agent task."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    state: TravelPlanningState
+    agent: Any
+    task_name: str
+    complete_stage: Optional[WorkflowStage] = None
+    result_formatter: Optional[Callable] = None
+    result_processor: Optional[Callable] = None
+
+
+def _serialize_value(value: Any) -> Any:
+    """Convert common Pydantic/dataclass/date objects into JSON-safe values."""
+    if value is None:
+        return None
+
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+
+    if is_dataclass(value):
+        return asdict(value)
+
+    if isinstance(value, dict):
+        return {
+            str(key): _serialize_value(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [_serialize_value(item) for item in value]
+
+    return value
+
+
+def get_user_query(state: TravelPlanningState) -> str:
+    """Return the original user query from the workflow state."""
+
+    if state.query is not None:
+        raw_query = getattr(state.query, "raw_query", None)
+
+        if raw_query:
+            return str(raw_query)
+
+    if state.conversation_history:
+        for message in reversed(state.conversation_history):
+            if isinstance(message, dict):
+                role = message.get("role")
+                content = message.get("content")
+
+                if role == "user" and content:
+                    return str(content)
+
+            else:
+                role = getattr(message, "role", None)
+                content = getattr(message, "content", None)
+
+                if role == "user" and content:
+                    return str(content)
+
+    return ""
+
+
+def build_agent_input(state: TravelPlanningState) -> str:
+    """
+    Build structured input for downstream agents.
+
+    Agents receive the original request together with the structured travel
+    requirements extracted during query analysis.
+    """
+
+    query_data: Dict[str, Any] = {}
+    preferences_data: Dict[str, Any] = {}
+
+    if state.query is not None:
+        query_data = _serialize_value(state.query)
+
+    if state.preferences is not None:
+        preferences_data = _serialize_value(state.preferences)
+
+    payload = {
+        "original_query": get_user_query(state),
+        "travel_query": query_data,
+        "preferences": preferences_data,
+    }
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+async def execute_agent_task(
+    params: AgentTaskParams,
+) -> TravelPlanningState:
+    """Execute an agent task and update the workflow state."""
+
+    state: TravelPlanningState = params.state
+
+    try:
+        logger.info(
+            "Executing agent task: %s",
+            params.task_name,
+        )
+
+        # Give downstream agents structured travel information.
+        user_input = build_agent_input(state)
+
+        result = await params.agent.run(user_input)
+
+        if result is None:
+            raise RuntimeError(
+                f"Agent {type(params.agent).__name__} returned no result."
+            )
+
+        # Treat explicit agent errors as workflow errors.
+        if isinstance(result, dict) and result.get("error"):
+            error_message = str(result["error"])
+
+            state.error_node = params.task_name
+            state.mark_error(error_message)
+
+            logger.error(
+                "Agent %s returned an error: %s",
+                type(params.agent).__name__,
+                error_message,
+            )
+
+            return state
+
+        # Initialize the travel plan if necessary.
+        if state.plan is None:
+            from travel_planner.data.models import TravelPlan
+
+            state.plan = TravelPlan(
+                destination=(
+                    state.query.destination
+                    if state.query and state.query.destination
+                    else "Unknown"
+                )
+            )
+
+        # Update workflow stage.
+        if params.complete_stage is not None:
+            state.update_stage(params.complete_stage)
+
+        # Format the result.
+        if params.result_formatter is not None:
+            formatted_result = params.result_formatter(result)
+        else:
+            formatted_result = result
+
+        # Process the result and allow the processor to update the state.
+        if params.result_processor is not None:
+            processed_result = params.result_processor(
+                state,
+                result,
+            )
+
+            if processed_result is not None:
+                result = processed_result
+
+        state.add_task_result(
+            params.task_name,
+            formatted_result,
+        )
+
+        state.conversation_history.append(
+            {
+                "role": "assistant",
+                "content": str(formatted_result),
+                "task": params.task_name,
+            }
+        )
+
+        logger.info(
+            "Agent task completed successfully: %s",
+            params.task_name,
+        )
+
+        return state
+
+    except Exception as exc:
+        error_message = (
+            f"{type(params.agent).__name__} failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        logger.exception(error_message)
+
+        state.error_node = params.task_name
+        state.mark_error(error_message)
+
+        return state
+
+
+def create_node_function(
+    agent_class: Any,
+    task_name: str,
+    complete_stage: Optional[WorkflowStage] = None,
+    result_formatter: Optional[Callable] = None,
+    result_processor: Optional[Callable] = None,
+) -> Callable:
+    """Create a LangGraph-compatible node function."""
+
+    async def node_function(
+        state: TravelPlanningState,
+    ) -> TravelPlanningState:
+
+        agent = agent_class()
+
+        params = AgentTaskParams(
+            state=state,
+            agent=agent,
+            task_name=task_name,
+            complete_stage=complete_stage,
+            result_formatter=result_formatter,
+            result_processor=result_processor,
+        )
+
+        return await execute_agent_task(params)
+
+    node_function.__name__ = task_name
+
+    return node_function

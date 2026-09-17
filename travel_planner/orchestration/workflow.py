@@ -1,0 +1,662 @@
+"""
+Workflow orchestration for the travel planner system.
+
+This module provides the high-level interface for executing the LangGraph
+travel-planning workflow, handling errors, and resuming checkpoints.
+"""
+
+from __future__ import annotations
+
+import traceback
+from datetime import datetime
+from typing import Any, cast
+
+from travel_planner.data.models import (
+    TravelPlan,
+    TravelQuery,
+    UserPreferences,
+)
+
+from travel_planner.orchestration.core.agent_registry import (
+    register_default_agents,
+)
+
+from travel_planner.orchestration.core.graph_builder import (
+    create_planning_graph,
+)
+
+from travel_planner.orchestration.serialization.checkpoint import (
+    save_state_checkpoint,
+)
+
+from travel_planner.orchestration.states.planning_state import (
+    TravelPlanningState,
+)
+
+from travel_planner.utils.logging import get_logger
+
+
+logger = get_logger(__name__)
+
+
+class TravelWorkflow:
+    """
+    Coordinates the complete travel-planning workflow.
+    """
+
+    def __init__(self):
+        """Initialize the workflow."""
+
+        register_default_agents()
+
+        self.graph = create_planning_graph()
+
+    def process_query(
+        self,
+        query: str,
+        preferences: UserPreferences | None = None,
+    ) -> TravelPlan:
+        """
+        Process a travel query synchronously.
+        """
+
+        logger.info(
+            "Processing travel query: %s",
+            query,
+        )
+
+        initial_state = TravelPlanningState(
+            query=TravelQuery(
+                raw_query=query
+            ),
+            preferences=(
+                preferences
+                or UserPreferences()
+            ),
+            conversation_history=[
+                {
+                    "role": "user",
+                    "content": query,
+                }
+            ],
+        )
+
+        try:
+
+            final_state = self._execute_graph(
+                initial_state
+            )
+
+            return final_state.plan
+
+        except Exception as exc:
+
+            return self._handle_workflow_exception(
+                initial_state,
+                exc,
+            )
+
+    async def process_query_async(
+        self,
+        query: str,
+        preferences: UserPreferences | None = None,
+    ) -> TravelPlan:
+        """
+        Process a travel query asynchronously.
+        """
+
+        logger.info(
+            "Processing travel query asynchronously: %s",
+            query,
+        )
+
+        initial_state = TravelPlanningState(
+            query=TravelQuery(
+                raw_query=query
+            ),
+            preferences=(
+                preferences
+                or UserPreferences()
+            ),
+            conversation_history=[
+                {
+                    "role": "user",
+                    "content": query,
+                }
+            ],
+        )
+
+        try:
+
+            final_state = (
+                await self._execute_graph_async(
+                    initial_state
+                )
+            )
+
+            return final_state.plan
+
+        except Exception as exc:
+
+            return self._handle_workflow_exception(
+                initial_state,
+                exc,
+            )
+
+    async def execute(
+        self,
+        state: TravelPlanningState,
+    ) -> TravelPlanningState:
+        """Execute an existing workflow state asynchronously."""
+
+        return await self._execute_graph_async(
+            state
+        )
+
+    def _handle_workflow_exception(
+        self,
+        state: TravelPlanningState,
+        error: Exception,
+    ) -> TravelPlan:
+        """
+        Convert workflow exceptions into appropriate travel plans.
+
+        Exception class names are checked rather than importing version-specific
+        LangGraph exception classes. This keeps the application compatible with
+        the installed LangGraph version and with test doubles.
+        """
+
+        error_name = (
+            error.__class__.__name__
+        )
+
+        error_text = str(error)
+
+        logger.error(
+            "Workflow exception [%s]: %s",
+            error_name,
+            error_text,
+        )
+
+        # Validation errors
+        if (
+            error_name == "ValidationError"
+            or (
+                isinstance(error, ValueError)
+                and error_name != "NodeError"
+            )
+        ):
+
+            state.error = (
+                f"Validation error: "
+                f"{error_text}"
+            )
+
+            state.conversation_history.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Error: The travel query couldn't "
+                        "be processed due to validation "
+                        f"issues. {error_text}"
+                    ),
+                }
+            )
+
+            return self._create_error_plan(
+                error,
+                "validation_error",
+            )
+
+        # Node execution errors
+        if error_name == "NodeError":
+
+            node_name = getattr(
+                error,
+                "node_name",
+                "unknown",
+            )
+
+            logger.error(
+                "Error occurred in node: %s",
+                node_name,
+            )
+
+            state.error = (
+                f"Error in {node_name} "
+                f"stage: {error_text}"
+            )
+
+            return self._create_error_plan(
+                error,
+                f"node_error_{node_name}",
+            )
+
+        # Interruptions
+        if (
+            error_name == "InterruptibleError"
+            or "Interrupt" in error_name
+        ):
+
+            logger.info(
+                "Workflow interrupted: %s",
+                error_text,
+            )
+
+            return self._handle_interruption(
+                state,
+                error,
+            )
+
+        # Runtime errors
+        if isinstance(
+            error,
+            RuntimeError,
+        ):
+
+            state.error = (
+                f"Workflow runtime error: "
+                f"{error_text}"
+            )
+
+            return self._create_error_plan(
+                error,
+                "runtime_error",
+            )
+
+        # Graph-related errors from compatible versions
+        if "GraphError" in error_name:
+
+            state.error = (
+                f"Workflow error: "
+                f"{error_text}"
+            )
+
+            return self._create_error_plan(
+                error,
+                "graph_error",
+            )
+
+        # Invalid state-update errors
+        if "InvalidUpdate" in error_name:
+
+            state.error = (
+                f"Invalid state update: "
+                f"{error_text}"
+            )
+
+            return self._create_error_plan(
+                error,
+                "invalid_state_update",
+            )
+
+        # Everything else
+        logger.error(
+            traceback.format_exc()
+        )
+
+        state.error = (
+            f"Unexpected error: "
+            f"{error_text}"
+        )
+
+        return self._create_error_plan(
+            error,
+            "unexpected_error",
+        )
+
+    def _execute_graph(
+        self,
+        initial_state: TravelPlanningState,
+    ) -> TravelPlanningState:
+        """Execute the graph synchronously."""
+
+        logger.info(
+            "Starting workflow graph execution"
+        )
+
+        try:
+
+            result = self.graph.invoke(
+                initial_state
+            )
+
+            logger.info(
+                "Workflow execution completed successfully"
+            )
+
+            if isinstance(result, TravelPlanningState):
+                return result
+
+            # LangGraph may return an AddableValuesDict/dict even when the
+            # graph state is a Pydantic model. Re-validate it before callers
+            # access state attributes such as .plan or .error.
+            return TravelPlanningState.model_validate(dict(result))
+
+        except Exception as exc:
+
+            logger.error(
+                "Error executing graph: %s",
+                exc,
+            )
+
+            raise
+
+    async def _execute_graph_async(
+        self,
+        initial_state: TravelPlanningState,
+    ) -> TravelPlanningState:
+        """Execute the graph asynchronously."""
+
+        logger.info(
+            "Starting async workflow graph execution"
+        )
+
+        try:
+
+            result = await self.graph.ainvoke(
+                initial_state
+            )
+
+            logger.info(
+                "Async workflow execution completed successfully"
+            )
+
+            if isinstance(result, TravelPlanningState):
+                return result
+
+            return TravelPlanningState.model_validate(dict(result))
+
+        except Exception as exc:
+
+            logger.error(
+                "Error executing async graph: %s",
+                exc,
+            )
+
+            raise
+
+    def _create_error_plan(
+        self,
+        error: Exception,
+        error_type: str,
+    ) -> TravelPlan:
+        """Create a failed travel plan."""
+
+        error_plan = TravelPlan()
+
+        error_plan.metadata = {
+            "error": str(error),
+            "error_type": error_type,
+            "timestamp": (
+                datetime.now().isoformat()
+            ),
+            "status": "failed",
+        }
+
+        error_plan.alerts = [
+            f"Error: {error!s}"
+        ]
+
+        return error_plan
+
+    def _handle_interruption(
+        self,
+        state: TravelPlanningState,
+        interrupt_error: Exception,
+    ) -> TravelPlan:
+        """
+        Handle a workflow interruption and preserve partial state.
+        """
+
+        logger.info(
+            "Handling workflow interruption: %s",
+            interrupt_error,
+        )
+
+        partial_plan = (
+            state.plan
+            or TravelPlan()
+        )
+
+        if partial_plan.metadata is None:
+            partial_plan.metadata = {}
+
+        checkpoint_id = (
+            state.travel_checkpoint_id
+            or (
+                "auto_"
+                + datetime.now().strftime(
+                    "%Y%m%d%H%M%S"
+                )
+            )
+        )
+
+        partial_plan.metadata.update(
+            {
+                "interrupted": True,
+                "interruption_reason": (
+                    str(interrupt_error)
+                ),
+                "timestamp": (
+                    datetime.now().isoformat()
+                ),
+                "current_stage": (
+                    str(state.current_stage)
+                ),
+                "resumable": True,
+                "checkpoint_id": checkpoint_id,
+            }
+        )
+
+        if not partial_plan.alerts:
+            partial_plan.alerts = []
+
+        partial_plan.alerts.append(
+            "Note: This plan is incomplete due "
+            "to an interruption: "
+            f"{interrupt_error!s}"
+        )
+
+        if not state.travel_checkpoint_id:
+
+            state.travel_checkpoint_id = (
+                checkpoint_id
+            )
+
+            self._store_interrupted_state(
+                state
+            )
+
+        return partial_plan
+
+    def _store_interrupted_state(
+        self,
+        state: TravelPlanningState,
+    ) -> None:
+        """Save an interrupted state."""
+
+        checkpoint_id = (
+            save_state_checkpoint(
+                state
+            )
+        )
+
+        logger.info(
+            "Stored interrupted state with checkpoint ID: %s",
+            checkpoint_id,
+        )
+
+    def resume_workflow(
+        self,
+        checkpoint_id: str,
+        updates: dict[str, Any] | None = None,
+    ) -> TravelPlan:
+        """Resume a workflow from a saved checkpoint."""
+
+        from travel_planner.orchestration.serialization.checkpoint import (
+            load_state_checkpoint,
+        )
+
+        logger.info(
+            "Resuming workflow from checkpoint: %s",
+            checkpoint_id,
+        )
+
+        try:
+
+            state = load_state_checkpoint(
+                checkpoint_id
+            )
+
+            if updates:
+
+                for key, value in updates.items():
+
+                    if hasattr(
+                        state,
+                        key,
+                    ):
+                        setattr(
+                            state,
+                            key,
+                            value,
+                        )
+
+            state.interrupted = False
+            state.interruption_reason = None
+
+            state.conversation_history.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Resuming workflow from "
+                        f"stage: {state.current_stage}"
+                    ),
+                }
+            )
+
+            resumed_state = (
+                self._execute_graph(
+                    state
+                )
+            )
+
+            return resumed_state.plan
+
+        except Exception as exc:
+
+            logger.error(
+                "Error resuming workflow: %s",
+                exc,
+            )
+
+            return self._create_resume_error_plan(
+                exc,
+                checkpoint_id,
+                False,
+            )
+
+    async def resume_workflow_async(
+        self,
+        checkpoint_id: str,
+        updates: dict[str, Any] | None = None,
+    ) -> TravelPlan:
+        """Resume a workflow asynchronously."""
+
+        from travel_planner.orchestration.serialization.checkpoint import (
+            load_state_checkpoint,
+        )
+
+        logger.info(
+            "Resuming workflow asynchronously from checkpoint: %s",
+            checkpoint_id,
+        )
+
+        try:
+
+            state = load_state_checkpoint(
+                checkpoint_id
+            )
+
+            if updates:
+
+                for key, value in updates.items():
+
+                    if hasattr(
+                        state,
+                        key,
+                    ):
+                        setattr(
+                            state,
+                            key,
+                            value,
+                        )
+
+            state.interrupted = False
+            state.interruption_reason = None
+
+            state.conversation_history.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Resuming workflow from "
+                        f"stage: {state.current_stage}"
+                    ),
+                }
+            )
+
+            resumed_state = (
+                await self._execute_graph_async(
+                    state
+                )
+            )
+
+            return resumed_state.plan
+
+        except Exception as exc:
+
+            logger.error(
+                "Error resuming workflow asynchronously: %s",
+                exc,
+            )
+
+            return self._create_resume_error_plan(
+                exc,
+                checkpoint_id,
+                True,
+            )
+
+    def _create_resume_error_plan(
+        self,
+        error: Exception,
+        checkpoint_id: str,
+        asynchronous: bool,
+    ) -> TravelPlan:
+        """Create an error plan for failed workflow resumption."""
+
+        error_plan = TravelPlan()
+
+        error_type = "resume_error"
+
+        error_plan.metadata = {
+            "error": str(error),
+            "error_type": error_type,
+            "timestamp": (
+                datetime.now().isoformat()
+            ),
+            "status": "failed",
+            "checkpoint_id": checkpoint_id,
+        }
+
+        prefix = (
+            "Error resuming workflow asynchronously: "
+            if asynchronous
+            else "Error resuming workflow: "
+        )
+
+        error_plan.alerts = [
+            f"{prefix}{error!s}"
+        ]
+
+        return error_plan
